@@ -1,0 +1,138 @@
+---
+title: "Bayesian Logistic Regression"
+output: pdf_document
+date: "2026-04-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+
+library(tidyverse)
+library(ggplot2)
+library(rstanarm)
+set.seed(33)
+```
+
+```{r}
+df <- read_csv("nsi_MA.csv")
+
+high_risk_zones <- c("VE", "AE", "A", "AO", "AH")
+df$target_label <- as.integer(df$firmzone %in% high_risk_zones)
+
+num_cols <- c("ground_elv", "found_ht", "val_struct", "med_yr_blt", "sqft", "num_story")
+cat_cols <- c("bldgtype", "found_type")
+
+df_features <- df[c(num_cols, cat_cols, 'target_label')]
+
+df_features
+```
+
+```{r}
+split_idx <- floor(0.8 * nrow(df_features))
+train_df <- df_features[1:split_idx, ]
+test_df <- df_features[(split_idx + 1):nrow(df_features), ]
+
+X_mean <- colMeans(train_df[num_cols])
+X_std <- apply(train_df[num_cols], 2, sd)
+
+train_df[num_cols] <- sweep(as.matrix(train_df[num_cols]), 2, X_mean, "-")
+train_df[num_cols] <- sweep(as.matrix(train_df[num_cols]), 2, X_std + 1e-8, "/")
+test_df[num_cols] <- sweep(as.matrix(test_df[num_cols]),  2, X_mean, "-")
+test_df[num_cols] <- sweep(as.matrix(test_df[num_cols]),  2, X_std + 1e-8, "/")
+```
+
+```{r}
+blr_model <- stan_glm(
+  target_label ~ .,          
+  data = train_df,
+  family = binomial(link = "logit"), 
+  prior = normal(0, 2.5),          
+  prior_intercept = normal(0, 10),   
+  chains = 4,              
+  iter = 1000,        
+  warmup = 500,          
+  cores = 4,            
+  seed = 33,
+  refresh = 200
+)
+
+```
+
+```{r}
+print(summary(blr_model, probs = c(0.025, 0.975)))
+```
+
+```{r}
+post_probs <- posterior_epred(blr_model, newdata = test_df)
+pred_mean <- colMeans(post_probs)
+predictions <- as.integer(pred_mean > 0.5)
+
+Y_test <- test_df$target_label
+tp <- sum(predictions == 1 & Y_test == 1)
+tn <- sum(predictions == 0 & Y_test == 0)
+fp <- sum(predictions == 1 & Y_test == 0)
+fn <- sum(predictions == 0 & Y_test == 1)
+accuracy <- mean(predictions == Y_test)
+precision <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+recall <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+f1 <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), 0)
+
+cat(sprintf("Accuracy:%.2f%%\n", accuracy * 100))
+cat(sprintf("Precision:%.2f%%\n", precision * 100))
+cat(sprintf("Recall:%.2f%%\n", recall * 100))
+cat(sprintf("F1 Score:%.4f\n", f1))
+
+```
+
+```{r}
+post_draws <- as.data.frame(blr_model)
+
+coef_cols <- setdiff(colnames(post_draws), c("(Intercept)", "sigma"))
+coef_means <- colMeans(post_draws[, coef_cols])
+
+coef_means <- sort(coef_means, decreasing = FALSE)
+top10 <- tail(coef_means[order(abs(coef_means))], 10)
+top10_df <- data.frame(feature = names(top10), mean = as.numeric(top10))
+
+coef_plot <- ggplot(top10_df, aes(x = mean, y = reorder(feature, mean))) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Top 10 Feature Coefficients",
+    x = "Posterior Mean Coefficient",
+    y = "Feature"
+  ) +
+  theme_minimal()
+
+print(coef_plot)
+```
+
+```{r}
+top6_names <- names(sort(abs(coef_means), decreasing = TRUE))[1:6]
+
+
+top6_draws <- post_draws[, top6_names]
+plot_df <- data.frame(
+  feature = rep(top6_names, each = nrow(top6_draws)),
+  value = unlist(top6_draws, use.names = FALSE)
+)
+
+coef_dist <- ggplot(plot_df, aes(x = value, fill = feature)) +
+  geom_density(alpha = 0.7, color = "white") +
+  facet_wrap(~ feature, scales = "free", ncol = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "gray40", linewidth = 0.5) +
+  labs(
+    title = "Top 6 Features's Posterior Distributions",
+    subtitle = "4000 posterior draws of that coefficient",
+    x = "Coefficient value",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(coef_dist)
+```
